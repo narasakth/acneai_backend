@@ -2,8 +2,8 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 import io
-import torch
-from torchvision import transforms, models
+import onnxruntime as ort
+import numpy as np
 import os
 
 app = FastAPI(title="AcneAI Backend", version="1.0.0")
@@ -21,8 +21,7 @@ app.add_middleware(
 )
 
 # Configuration
-MODEL_PATH = "model.pth"
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_PATH = "model.onnx"
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
@@ -36,17 +35,8 @@ def load_model():
         return None
 
     try:
-        print(f"Loading model from {MODEL_PATH}...")
-        
-        # Instantiate ResNet-50 for 4 classes
-        model_instance = models.resnet50(num_classes=4)
-        
-        # Load the state dict
-        state_dict = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-        model_instance.load_state_dict(state_dict)
-        
-        model = model_instance.to(DEVICE)
-        model.eval()
+        print(f"Loading ONNX model from {MODEL_PATH}...")
+        model = ort.InferenceSession(MODEL_PATH)
         print("Model loaded successfully!")
     except Exception as e:
         print(f"Error loading model: {e}")
@@ -55,11 +45,13 @@ def load_model():
 # Initial load
 load_model()
 
-# Standard transforms
-transform = transforms.Compose([
-    transforms.Resize((640, 640)),
-    transforms.ToTensor(),
-])
+def preprocess_image(image: Image.Image) -> np.ndarray:
+    """Preprocess image to match torchvision ToTensor() and Resize()"""
+    image = image.resize((640, 640))
+    img_array = np.array(image, dtype=np.float32) / 255.0
+    img_array = np.transpose(img_array, (2, 0, 1))
+    input_tensor = np.expand_dims(img_array, axis=0)
+    return input_tensor
 
 # Class name mapping
 CLASS_NAMES = ["Mild", "Moderate", "Severe", "Very Severe"]
@@ -95,27 +87,30 @@ async def process_single_image(contents: bytes, image_label: str):
     """Process a single image and return predictions"""
     try:
         image = Image.open(io.BytesIO(contents)).convert("RGB")
-        input_tensor = transform(image).unsqueeze(0).to(DEVICE)
+        input_tensor = preprocess_image(image)
 
-        with torch.no_grad():
-            output = model(input_tensor)
+        input_name = model.get_inputs()[0].name
+        output = model.run(None, {input_name: input_tensor})[0]
 
         predictions = []
 
-        if isinstance(output, torch.Tensor):
-            probs = torch.nn.functional.softmax(output, dim=1)
-            topk = torch.topk(probs, min(3, probs.size(1)))
+        # Apply softmax
+        exp_out = np.exp(output - np.max(output, axis=1, keepdims=True))
+        probs = exp_out / np.sum(exp_out, axis=1, keepdims=True)
+        probs = probs[0]
 
-            for i in range(topk.indices.size(1)):
-                idx = topk.indices[0][i].item()
-                score = topk.values[0][i].item()
-                name = CLASS_NAMES[idx] if idx < len(CLASS_NAMES) else f"class_{idx}"
+        # Get top 3 predictions
+        topk_indices = np.argsort(probs)[::-1][:min(3, len(probs))]
 
-                predictions.append({
-                    "class": name,
-                    "confidence": round(score, 4),
-                    "source": image_label
-                })
+        for idx in topk_indices:
+            score = probs[idx]
+            name = CLASS_NAMES[idx] if idx < len(CLASS_NAMES) else f"class_{idx}"
+
+            predictions.append({
+                "class": name,
+                "confidence": round(float(score), 4),
+                "source": image_label
+            })
 
         return predictions
     except Exception as e:
@@ -212,9 +207,8 @@ async def analyze_multi_images(
 @app.get("/")
 def read_root():
     return {
-        "status": "AcneAI Backend Running",
+        "status": "AcneAI Backend Running (ONNX)",
         "model_loaded": model is not None,
-        "device": str(DEVICE)
     }
 
 
@@ -223,5 +217,4 @@ def health_check():
     return {
         "healthy": True,
         "model_loaded": model is not None,
-        "device": str(DEVICE)
     }
