@@ -1,3 +1,5 @@
+# uvicorn main:app --reload
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
@@ -5,6 +7,11 @@ import io
 import onnxruntime as ort
 import numpy as np
 import os
+from recommendations import get_recommendation, get_all_recommendations
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
 
 app = FastAPI(title="AcneAI Backend", version="1.0.0")
 
@@ -19,25 +26,43 @@ app.add_middleware(
 
 # Configuration
 MODEL_PATH = "model.onnx"
+DETECTION_MODEL_PATH = os.path.join("detection", "v1", "best.pt")
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
-# Global model variable
+# Global model variables
 model = None
+detection_model = None
 
 def load_model():
-    global model
+    global model, detection_model
+    
+    # Load ONNX classification model
     if not os.path.exists(MODEL_PATH):
         print(f"[{MODEL_PATH}] not found. Waiting for file to be placed...")
-        return None
-
-    try:
-        print(f"Loading ONNX model from {MODEL_PATH}...")
-        model = ort.InferenceSession(MODEL_PATH)
-        print("Model loaded successfully!")
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        model = None
+    else:
+        try:
+            print(f"Loading ONNX model from {MODEL_PATH}...")
+            model = ort.InferenceSession(MODEL_PATH)
+            print("Classification model loaded successfully!")
+        except Exception as e:
+            print(f"Error loading classification model: {e}")
+            model = None
+            
+    # Load YOLO detection model
+    if not os.path.exists(DETECTION_MODEL_PATH):
+        print(f"[{DETECTION_MODEL_PATH}] not found. Waiting for file to be placed...")
+    else:
+        if YOLO is None:
+            print("ultralytics library not installed. Cannot load detection model.")
+        else:
+            try:
+                print(f"Loading YOLO detection model from {DETECTION_MODEL_PATH}...")
+                detection_model = YOLO(DETECTION_MODEL_PATH)
+                print("Detection model loaded successfully!")
+            except Exception as e:
+                print(f"Error loading detection model: {e}")
+                detection_model = None
 
 # Initial load
 load_model()
@@ -201,11 +226,121 @@ async def analyze_multi_images(
     }
 
 
+async def process_detection(contents: bytes, image_label: str):
+    """Process a single image for object detection using YOLO"""
+    if detection_model is None:
+        raise ValueError("Detection model is not loaded")
+        
+    try:
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
+        # Run YOLO inference
+        results = detection_model(image)
+        
+        detections = []
+        for result in results:
+            boxes = result.boxes
+            for box in boxes:
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                conf = float(box.conf[0])
+                cls_id = int(box.cls[0])
+                cls_name = result.names[cls_id]
+                
+                detections.append({
+                    "xmin": round(x1, 2),
+                    "ymin": round(y1, 2),
+                    "xmax": round(x2, 2),
+                    "ymax": round(y2, 2),
+                    "confidence": round(conf, 4),
+                    "class": cls_name,
+                    "source": image_label
+                })
+                
+        return detections
+    except Exception as e:
+        print(f"Error processing detection for {image_label}: {e}")
+        return []
+
+
+@app.post("/detect")
+async def detect_image(file: UploadFile = File(...)):
+    global detection_model
+
+    # Reload if not loaded
+    if detection_model is None:
+        load_model()
+        if detection_model is None:
+            return {
+                "detections": [],
+                "count": 0,
+                "warning": "Detection model not loaded. Check server console."
+            }
+
+    contents = await validate_image(file)
+
+    try:
+        detections = await process_detection(contents, "front")
+        return {
+            "detections": detections,
+            "count": len(detections)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/detect-multi")
+async def detect_multi_images(
+    front: UploadFile = File(...),
+    left: UploadFile = File(None),
+    right: UploadFile = File(None)
+):
+    """Detect acne in multiple face images (front, left, right) and combine results"""
+    global detection_model
+
+    # Reload if not loaded
+    if detection_model is None:
+        load_model()
+        if detection_model is None:
+            return {
+                "detections": [],
+                "count": 0,
+                "images_processed": 0,
+                "warning": "Detection model not loaded."
+            }
+
+    all_detections = []
+    images_processed = 0
+
+    if front:
+        contents = await validate_image(front)
+        preds = await process_detection(contents, "front")
+        all_detections.extend(preds)
+        images_processed += 1
+
+    if left:
+        contents = await validate_image(left)
+        preds = await process_detection(contents, "left")
+        all_detections.extend(preds)
+        images_processed += 1
+
+    if right:
+        contents = await validate_image(right)
+        preds = await process_detection(contents, "right")
+        all_detections.extend(preds)
+        images_processed += 1
+
+    return {
+        "detections": all_detections,
+        "count": len(all_detections),
+        "images_processed": images_processed
+    }
+
+
 @app.get("/")
 def read_root():
     return {
-        "status": "AcneAI Backend Running (ONNX)",
+        "status": "AcneAI Backend Running (ONNX Classification + YOLO Detection)",
         "model_loaded": model is not None,
+        "detection_model_loaded": detection_model is not None,
     }
 
 
@@ -214,4 +349,19 @@ def health_check():
     return {
         "healthy": True,
         "model_loaded": model is not None,
+        "detection_model_loaded": detection_model is not None,
     }
+
+
+@app.get("/recommendations/{level}")
+def get_recommendation_by_level(level: int):
+    """Get treatment recommendations for a specific severity level (1-4)"""
+    if level < 1 or level > 4:
+        raise HTTPException(status_code=400, detail="Severity level must be between 1 and 4")
+    return get_recommendation(level)
+
+
+@app.get("/recommendations")
+def get_recommendations_all():
+    """Get all treatment recommendations data"""
+    return get_all_recommendations()
