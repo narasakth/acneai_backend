@@ -1,32 +1,43 @@
+# ==========================================
+# Python Cache & Build Files
+# ==========================================
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .Python
 
-# Virtual environments
+# ==========================================
+# Virtual Environments
+# ==========================================
 venv/
 .venv/
 env/
 
-# Environment variables
+# ==========================================
+# Environment Variables (Secrets)
+# ==========================================
 .env
 
-# IDE / OS files
+# ==========================================
+# IDE & System Files
+# ==========================================
 .vscode/
 .idea/
 .DS_Store
 
-# Heavy or unnecessary files
+# ==========================================
+# Heavy Weights & Models (Exclude from Git)
+# ==========================================
 model.pth
-convert_to_onnx.py
+model.onnx.data
 detection/
 
+# ==========================================
+# Development, Test Scripts & Temporary Files
+# ==========================================
+convert_to_onnx.py
+compare_acne_detection.py
+compare_outputs/
 01.jpg
 02.jpg
-
-compare_acne_detection.py
-
-compare_outputs/
-
-model.onnx.data
